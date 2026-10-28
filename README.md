@@ -93,6 +93,13 @@ go generate ./pkg/profiler       # builds the BPF object via bpf2go (emits profi
 go build ./cmd/profiler          # profiler binary (uses generated bindings)
 ```
 
+`bpf.go` passes `-D__TARGET_ARCH_arm64`, so the commands above target ARM64. On x86_64 add the
+architecture for the BPF program (it is checked first and wins over the arm64 flag):
+
+```sh
+BPF2GO_CFLAGS="-D__TARGET_ARCH_x86" go generate ./pkg/profiler
+```
+
 ## Environment Variables
 
 ### Profiler Configuration
@@ -103,6 +110,8 @@ These environment variables configure the profiler itself:
 - `ENV_OUTPUT_PATH=/var/log/ebpf_http_env.yaml` - File path for environment variable logs (YAML format)
 - `SERVICE_MAP_PATH=""` - File path for service integration map (YAML format). If not set, service map is disabled.
 - `ENV_PREFIX_LIST=""` - Comma-separated list of environment variable key prefixes to include (case-sensitive). If not set, all environment variables are collected.
+- `ENV_INCLUDE_VALUES=1` - Write environment variable values too. By default only the variable names are written (`env_names`), because a profile needs names, not values. Values of secrets (names containing `PASSWORD`, `TOKEN`, `SECRET`, `API_KEY`, ...) and passwords inside URLs are always replaced with `[REDACTED]`.
+- `PROFILER_DEBUG=1` - Log events whose address family the profiler cannot decode.
 - `ADI_PROFILE_ALLOWED=""` - Comma-separated list of ADI_PROFILE values to profile (see Opt-In Profiling below). If not set, all processes with `ADI_PROFILE` set (any value) will be profiled.
 - `CONTAINERD_SOCKET=""` - Path to containerd or Docker socket. If not set, container metadata enrichment is disabled.
   - For Docker: `/var/run/docker.sock` (probably?)
@@ -336,6 +345,8 @@ Connection events include:
 - `category`: High-level classification (`database`, `cache`, or `message_bus`)
 - `confidence`: Detection confidence score (0-100)
 - `detection_reason`: Explanation of how the protocol was identified
+- `tls`, `server_name`: Set when the connection starts with a TLS ClientHello. `server_name` is the SNI host, which identifies an HTTPS destination (the payload itself is encrypted). These connections have protocol `tls`, on any port.
+- `env_hints`: Names of the process's environment variables whose value holds the destination's address (for example `DB_HOST` and `DB_PORT` for a Postgres connection). Values are never written.
 
 **Supported Protocols and Ports:**
 
@@ -535,7 +546,7 @@ The map follows the ObservedBehaviors schema with two main sections:
 - Output follows the ObservedBehaviors schema for compatibility with ADI tooling
 
 ### Environment Variables (YAML)
-Multi-document YAML with one document per PID:
+Multi-document YAML with one document per PID. By default each document lists the variable names under `env_names`; with `ENV_INCLUDE_VALUES=1` it has an `env` map with redacted values instead. The example below shows the older value format (`ENV_INCLUDE_VALUES=1`):
 ```yaml
 ---
 adi_profile_pid: 12345
@@ -573,3 +584,32 @@ Each document includes:
 - When `ENV_PREFIX_LIST` is used, only matching environment variables are included in `adi_profile_env` (PIDs may have empty `adi_profile_env: {}` if no variables match)
 - `adi_profile_name` only appears if the target process has `ADI_PROFILE_NAME` set
 - All documents are separated by `---` for proper YAML multi-document format
+
+## Checking a declared profile against what was observed (rc-verify)
+
+`rc-verify` compares a Runtime Conditions profile with the service map the profiler wrote, and reports what the profile is missing:
+
+```sh
+go build ./cmd/rc-verify
+./rc-verify --profile runtimeconditions.profile.yaml --map /some/path/ebpf_service_map.yaml --service shop
+```
+
+`--service` is the `ADI_PROFILE_NAME` of the process. The output uses these levels:
+
+| Level | Meaning |
+|---|---|
+| `ERROR` | A dependency was observed that no condition declares. Exit status 1. |
+| `WARN` | The condition is declared, but its env variables are not the ones the process used for that address. Exit status 1 with `--strict`. |
+| `INFO` | A condition is declared but was not observed (the code path may not have run). |
+| `OK` | Observed and declared. |
+
+Protocols map to conditions as follows: postgres, mysql and mssql to `datastore/relational`, mongodb to `datastore/document`, redis and memcached to `cache/key_value`, TLS and HTTP to `api/http`. Kafka, AMQP and NATS are reported as undeclared, because the common-integrations extension has no message bus kind.
+
+The profiler observes only what the process did while it ran, so a clean result means "everything observed is declared", not "everything the code can do is declared". Use it as a drift check in staging or CI.
+
+## Known limits
+
+- Linux only, and the profiler needs root (or `CAP_BPF` and `CAP_PERFMON`).
+- HTTPS payloads are encrypted at the syscall layer, so the profiler sees the destination host (SNI), not the method, path or response schema.
+- Only the first 2048 bytes of each syscall are captured, and `writev`, `sendfile` and `io_uring` are not hooked.
+- A connection is classified from its first bytes, so a protocol that is not seen at the start of a connection is missed.
