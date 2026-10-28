@@ -1,0 +1,49 @@
+apiVersion: runtimeconditions.io/v1alpha1
+kind: RuntimeConditionsProfile
+metadata:
+  name: shop
+workload:
+  uri: https://services.example.com/shop
+  version: 1.0.0
+extensions:
+  - https://runtimeconditions.io/extensions/common-integrations/v1alpha1/runtimeconditions.extension.yaml
+  - https://runtimeconditions.io/extensions/env-configuration/v1alpha1/runtimeconditions.extension.yaml
+conditions:
+  - kind: datastore
+    interface:
+      type: relational
+      engine: postgres
+    configuration:
+      env:
+        - name: DB_HOST
+          property: hostname
+        - name: DB_PORT
+          property: port
+        - name: DB_USER
+          property: username
+        - name: DB_PASSWORD
+          property: password
+          sensitive: true
+        - name: DB_NAME
+          property: database
+  - kind: cache
+    interface:
+      type: key_value
+      engine: redis
+    configuration:
+      env:
+        - name: REDIS_URL
+          property: url
+  - kind: api
+    interface:
+      type: http
+      spec:
+        format: openapi
+        uri: https://api.frankfurter.dev/v1/openapi.json
+      operations:
+        - method: GET
+          path: /latest
+    configuration:
+      env:
+        - name: EXCHANGE_API_URL
+          property: baseUrl

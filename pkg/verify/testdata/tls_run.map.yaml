@@ -1,0 +1,27 @@
+apiVersion: adi.dev/v1alpha1
+kind: ObservedBehaviors
+metadata:
+    name: http-profiler-local-2026-10-29t001248z
+spec:
+    generatedAt: "2026-10-29T00:12:48.620888002+05:30"
+    workloads:
+        - id: workload:container/tlstest
+          displayName: tlstest
+        - id: workload:container/api.frankfurter.dev
+          displayName: api.frankfurter.dev
+    behaviors:
+        - id: behavior:tlstest:tcp:api.frankfurter.dev:443:tls
+          sourceRef: workload:container/tlstest
+          destination:
+            workloadRef: workload:container/api.frankfurter.dev
+          facets:
+            protocol:
+                name: tls
+                category: unknown
+                classificationConfidence: 0.6
+                classificationReason: TLS handshake, SNI api.frankfurter.dev
+            network:
+                transport: tcp
+                port: 443
+                tls: true
+                serverName: api.frankfurter.dev
