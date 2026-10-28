@@ -44,7 +44,9 @@ func main() {
 	containerdSocket := envOrDefault("CONTAINERD_SOCKET", "")
 	containerdNamespace := envOrDefault("CONTAINERD_NAMESPACE", "default")
 
-	if err := profiler.NewRunner(port, output, envOutput, serviceMapOutput, envPrefixes, adiProfileAllowed, containerdSocket, containerdNamespace).Run(context.Background()); err != nil {
+	runner := profiler.NewRunner(port, output, envOutput, serviceMapOutput, envPrefixes, adiProfileAllowed, containerdSocket, containerdNamespace)
+	runner.SetIncludeEnvValues(os.Getenv("ENV_INCLUDE_VALUES") == "1")
+	if err := runner.Run(context.Background()); err != nil {
 		log.Fatalf("profiler failed: %v", err)
 	}
 }

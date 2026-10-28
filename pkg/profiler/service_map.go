@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,9 @@ type ConnectionInfo struct {
 	Port            uint16            `yaml:"port"`                       // Remote port
 	Confidence      int               `yaml:"confidence"`                 // 0-100 confidence score
 	Reason          string            `yaml:"reason,omitempty"`           // Detection reason
+	TLS             bool              `yaml:"tls,omitempty"`              // connection is TLS-wrapped
+	ServerName      string            `yaml:"server_name,omitempty"`      // SNI host, when known
+	EnvHints        []string          `yaml:"env_hints,omitempty"`        // env var names holding the address
 	FirstSeen       time.Time         `yaml:"first_seen"`
 	LastSeen        time.Time         `yaml:"last_seen"`
 	Count           int64             `yaml:"count"`
@@ -107,6 +111,9 @@ type ConnectionEventInfo struct {
 	Port       uint16            // Remote port
 	Confidence int               // 0-100
 	Reason     string            // Detection reason
+	TLS        bool              // connection is TLS-wrapped
+	ServerName string            // SNI host, when known
+	EnvHints   []string          // env var names that hold the connection's address
 }
 
 // ========================================================================
@@ -212,8 +219,11 @@ type HTTPInterface struct {
 
 // NetworkFacet describes network-level details
 type NetworkFacet struct {
-	Transport string `yaml:"transport"` // e.g., "tcp", "udp"
-	Port      uint16 `yaml:"port"`
+	Transport  string   `yaml:"transport"` // e.g., "tcp", "udp"
+	Port       uint16   `yaml:"port"`
+	TLS        bool     `yaml:"tls,omitempty"`
+	ServerName string   `yaml:"serverName,omitempty"` // SNI host, when known
+	EnvNames   []string `yaml:"envNames,omitempty"`   // env vars holding this destination's address
 }
 
 // BehaviorEvidence contains evidence about the observed behavior
@@ -366,7 +376,11 @@ func (sm *ServiceMap) RecordConnectionEvent(event ConnectionEventInfo) {
 		srcService = "unknown"
 	}
 	if dstService == "" {
-		dstService = event.Protocol // use protocol as destination name (e.g., "postgres", "redis")
+		if event.ServerName != "" {
+			dstService = event.ServerName // external TLS destination, named by its SNI host
+		} else {
+			dstService = event.Protocol // use protocol as destination name (e.g., "postgres", "redis")
+		}
 	}
 
 	now := time.Now()
@@ -378,7 +392,7 @@ func (sm *ServiceMap) RecordConnectionEvent(event ConnectionEventInfo) {
 	// Find or create connection info
 	var matchingConn *ConnectionInfo
 	for _, conn := range profile.Connections {
-		if conn.Destination == dstService && conn.Protocol == event.Protocol && conn.Port == event.Port {
+		if conn.Destination == dstService && conn.Protocol == event.Protocol && conn.Port == event.Port && conn.ServerName == event.ServerName {
 			matchingConn = conn
 			break
 		}
@@ -388,6 +402,7 @@ func (sm *ServiceMap) RecordConnectionEvent(event ConnectionEventInfo) {
 		// Update existing connection
 		matchingConn.LastSeen = now
 		matchingConn.Count++
+		matchingConn.EnvHints = mergeNames(matchingConn.EnvHints, event.EnvHints)
 		if event.Confidence > matchingConn.Confidence {
 			matchingConn.Confidence = event.Confidence
 			matchingConn.Reason = event.Reason
@@ -404,6 +419,9 @@ func (sm *ServiceMap) RecordConnectionEvent(event ConnectionEventInfo) {
 			Port:            event.Port,
 			Confidence:      event.Confidence,
 			Reason:          event.Reason,
+			TLS:             event.TLS,
+			ServerName:      event.ServerName,
+			EnvHints:        event.EnvHints,
 			FirstSeen:       now,
 			LastSeen:        now,
 			Count:           1,
@@ -655,8 +673,11 @@ func mapConnectionToBehavior(sourceServiceName string, conn *ConnectionInfo) Obs
 		},
 		Facets: BehaviorFacets{
 			Network: &NetworkFacet{
-				Transport: "tcp",
-				Port:      conn.Port,
+				Transport:  "tcp",
+				Port:       conn.Port,
+				TLS:        conn.TLS,
+				ServerName: conn.ServerName,
+				EnvNames:   conn.EnvHints,
 			},
 			Protocol: ProtocolFacet{
 				Name:                     conn.Protocol,
@@ -895,4 +916,18 @@ func (sm *ServiceMap) Flush() error {
 // Close stops the service map and performs final flush
 func (sm *ServiceMap) Close() error {
 	return sm.Flush()
+}
+
+// mergeNames returns the sorted union of two name lists.
+func mergeNames(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	var out []string
+	for _, name := range append(append([]string{}, a...), b...) {
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

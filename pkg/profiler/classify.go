@@ -37,6 +37,7 @@ const (
 	ProtocolNATS      Protocol = "nats"
 	ProtocolHTTP1     Protocol = "http/1.x"
 	ProtocolHTTP2     Protocol = "http/2"
+	ProtocolTLS       Protocol = "tls"
 )
 
 // Confidence is a simple 0–100 score for how confident the detector is.
@@ -65,6 +66,10 @@ type DetectionResult struct {
 	Category   Category
 	Confidence Confidence
 	Reason     string
+	// TLS is set when the first bytes are a TLS handshake. ServerName is the
+	// SNI host from a ClientHello, which is what identifies an HTTPS destination.
+	TLS        bool
+	ServerName string
 }
 
 // Detector is implemented by each protocol-specific detector.
@@ -96,6 +101,11 @@ var detectors = []Detector{
 func DetectConnection(meta ConnMeta, firstBytes []byte) DetectionResult {
 	var best DetectionResult
 
+	isTLS, serverName := parseTLSClientHello(firstBytes)
+	if isTLS {
+		meta.IsTLS = true
+	}
+
 	for _, d := range detectors {
 		res := d.Detect(meta, firstBytes)
 		if !res.Matched {
@@ -103,6 +113,24 @@ func DetectConnection(meta ConnMeta, firstBytes []byte) DetectionResult {
 		}
 		if !best.Matched || res.Confidence > best.Confidence {
 			best = res
+		}
+	}
+
+	// HTTPS and other TLS-wrapped traffic: the payload is encrypted, so the port
+	// guess says nothing about the destination. The SNI host does.
+	if isTLS && (!best.Matched || best.Category == CategoryHTTP) {
+		reason := "TLS handshake"
+		if serverName != "" {
+			reason += ", SNI " + serverName
+		}
+		return DetectionResult{
+			Matched:    true,
+			Protocol:   ProtocolTLS,
+			Category:   CategoryUnknown,
+			Confidence: ConfidenceMedium,
+			Reason:     reason,
+			TLS:        true,
+			ServerName: serverName,
 		}
 	}
 
@@ -121,6 +149,8 @@ func DetectConnection(meta ConnMeta, firstBytes []byte) DetectionResult {
 		best.Confidence = ConfidenceMedium
 		best.Reason = best.Reason + " (TLS - reduced confidence)"
 	}
+	best.TLS = isTLS
+	best.ServerName = serverName
 
 	return best
 }

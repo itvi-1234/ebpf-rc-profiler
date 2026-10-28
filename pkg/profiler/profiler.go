@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -99,6 +100,9 @@ type ConnectionEvent struct {
 	Category             string         `json:"category"`         // e.g., "database", "cache"
 	Confidence           int            `json:"confidence"`       // 0-100
 	DetectionReason      string         `json:"detection_reason"` // Why this protocol was detected
+	TLS                  bool           `json:"tls,omitempty"`
+	ServerName           string         `json:"server_name,omitempty"` // SNI host for TLS connections
+	EnvHints             []string       `json:"env_hints,omitempty"`   // env var names that hold this connection's address
 	SourceContainer      *ContainerInfo `json:"source_container,omitempty"`
 	DestinationContainer *ContainerInfo `json:"destination_container,omitempty"`
 	DestinationType      string         `json:"destination_type,omitempty"` // "container" or "external"
@@ -124,6 +128,8 @@ type Runner struct {
 	envOutputPath       string
 	serviceMapPath      string
 	envPrefixes         []string
+	includeEnvValues    bool                         // write (redacted) env values, not just names
+	pidEnv              map[uint32]map[string]string // full env per PID, kept in memory only
 	adiProfileAllowed   []string
 	seenPIDs            map[uint32]string // stores cmdline for each PID
 	pidAdiProfiles      map[uint32]string // stores ADI_PROFILE value for each PID
@@ -153,6 +159,7 @@ func NewRunner(port uint16, outputPath string, envOutputPath string, serviceMapP
 		pidAdiProfiles:      make(map[uint32]string),
 		pidNames:            make(map[uint32]string),
 		writtenPIDs:         make(map[uint32]bool),
+		pidEnv:              make(map[uint32]map[string]string),
 		containerdSocket:    containerdSocket,
 		containerdNamespace: containerdNamespace,
 		serviceMap:          serviceMap,
@@ -160,39 +167,34 @@ func NewRunner(port uint16, outputPath string, envOutputPath string, serviceMapP
 	}
 }
 
+// SetIncludeEnvValues makes the env output include (redacted) values. By default
+// only variable names are written, because names are what a profile needs.
+func (r *Runner) SetIncludeEnvValues(include bool) { r.includeEnvValues = include }
+
+// processEnv returns the process environment, reading /proc/<pid>/environ once.
+func (r *Runner) processEnv(pid uint32) (map[string]string, error) {
+	if env, ok := r.pidEnv[pid]; ok {
+		return env, nil
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		return nil, err
+	}
+	env := parseEnviron(data)
+	r.pidEnv[pid] = env
+	return env, nil
+}
+
 func (r *Runner) shouldProfilePID(pid uint32) (bool, string, string) {
-	// Read environment variables from /proc/<pid>/environ
-	environPath := fmt.Sprintf("/proc/%d/environ", pid)
-	data, err := os.ReadFile(environPath)
+	env, err := r.processEnv(pid)
 	if err != nil {
 		// Process may have exited, skip silently
 		return false, "", ""
 	}
 
-	// Parse environ file to find ADI_PROFILE, ADI_PROFILE_DISABLED, and ADI_PROFILE_NAME
-	var adiProfile string
-	var adiProfileName string
-	var adiProfileDisabled bool
-
-	parts := strings.Split(string(data), "\x00")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		idx := strings.Index(part, "=")
-		if idx > 0 {
-			key := part[:idx]
-			value := part[idx+1:]
-
-			if key == "ADI_PROFILE" {
-				adiProfile = value
-			} else if key == "ADI_PROFILE_DISABLED" && value == "1" {
-				adiProfileDisabled = true
-			} else if key == "ADI_PROFILE_NAME" {
-				adiProfileName = value
-			}
-		}
-	}
+	adiProfile := env["ADI_PROFILE"]
+	adiProfileName := env["ADI_PROFILE_NAME"]
+	adiProfileDisabled := env["ADI_PROFILE_DISABLED"] == "1"
 
 	// Check opt-in criteria
 	// 1. ADI_PROFILE_DISABLED must not be set
@@ -230,9 +232,7 @@ func (r *Runner) collectAndWriteEnv(pid uint32, envFile *os.File) {
 	}
 	r.writtenPIDs[pid] = true
 
-	// Read environment variables from /proc/<pid>/environ
-	environPath := fmt.Sprintf("/proc/%d/environ", pid)
-	data, err := os.ReadFile(environPath)
+	env, err := r.processEnv(pid)
 
 	// Write YAML document separator
 	fmt.Fprintf(envFile, "---\n")
@@ -265,41 +265,45 @@ func (r *Runner) collectAndWriteEnv(pid uint32, envFile *os.File) {
 		return
 	}
 
-	if len(data) == 0 {
+	if len(env) == 0 {
 		fmt.Fprintf(envFile, "adi_profile_env: {}\n")
 		envFile.Sync()
 		return
 	}
 
-	// Parse environ file (null-separated key=value pairs)
 	envVars := make(map[string]string)
-	parts := strings.Split(string(data), "\x00")
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-		// Split on first '=' to get key and value
-		idx := strings.Index(part, "=")
-		if idx > 0 {
-			key := part[:idx]
-			value := part[idx+1:]
-
-			// Filter by prefix if prefixes are specified
-			if len(r.envPrefixes) > 0 {
-				hasPrefix := false
-				for _, prefix := range r.envPrefixes {
-					if strings.HasPrefix(key, prefix) {
-						hasPrefix = true
-						break
-					}
-				}
-				if !hasPrefix {
-					continue
+	for key, value := range env {
+		// Filter by prefix if prefixes are specified
+		if len(r.envPrefixes) > 0 {
+			hasPrefix := false
+			for _, prefix := range r.envPrefixes {
+				if strings.HasPrefix(key, prefix) {
+					hasPrefix = true
+					break
 				}
 			}
-
-			envVars[key] = value
+			if !hasPrefix {
+				continue
+			}
 		}
+		envVars[key] = redactEnvValue(key, value)
+	}
+
+	if !r.includeEnvValues {
+		names := make([]string, 0, len(envVars))
+		for key := range envVars {
+			names = append(names, key)
+		}
+		sort.Strings(names)
+		fmt.Fprintf(envFile, "env_names:\n")
+		if len(names) == 0 {
+			fmt.Fprintf(envFile, "  []\n")
+		}
+		for _, name := range names {
+			fmt.Fprintf(envFile, "  - %s\n", name)
+		}
+		envFile.Sync()
+		return
 	}
 
 	// Write env vars as YAML
@@ -487,7 +491,7 @@ func (r *Runner) Run(ctx context.Context) error {
 
 		// Check if this is traffic on an interesting port for connection classification
 		dport := ntohs(ev.Dport)
-		interestingPort := isInterestingPort(dport)
+		interestingPort := isInterestingPort(dport) || isTLSClientHello(ev.Data[:ev.DataLen])
 
 		// Skip events that don't match either criteria
 		if !portMatch && !interestingPort {
@@ -665,7 +669,7 @@ func (r *Runner) formatEventJSON(ev *Event, parsed Parsed) (string, error) {
 	cmdline := r.seenPIDs[ev.Pid]
 
 	event := HTTPEvent{
-		Timestamp:  time.Unix(0, int64(ev.Ts)).Format(time.RFC3339Nano),
+		Timestamp:  kernelTime(ev.Ts).Format(time.RFC3339Nano),
 		PID:        ev.Pid,
 		Comm:       strings.Trim(string(ev.Comm[:]), "\x00"),
 		Cmdline:    cmdline,
@@ -679,8 +683,8 @@ func (r *Runner) formatEventJSON(ev *Event, parsed Parsed) (string, error) {
 		URL:        parsed.URL,
 		StatusCode: parsed.StatusCode,
 		Body:       parsed.Body,
-		Headers:    parsed.Headers,
-		RawPayload: payload,
+		Headers:    redactHeaders(parsed.Headers),
+		RawPayload: redactRawPayload(payload),
 	}
 
 	// Enrich with container metadata if resolver is available
@@ -859,7 +863,6 @@ func (r *Runner) tryClassifyAndFormatConnection(ev *Event) (string, error) {
 		LocalPort:  sport,
 		RemoteIP:   daddr,
 		RemotePort: dport,
-		IsTLS:      false, // TODO: detect TLS handshake if needed
 	}
 
 	// Get payload data
@@ -892,7 +895,7 @@ func (r *Runner) tryClassifyAndFormatConnection(ev *Event) (string, error) {
 	cmdline := r.seenPIDs[ev.Pid]
 
 	event := ConnectionEvent{
-		Timestamp:       time.Unix(0, int64(ev.Ts)).Format(time.RFC3339Nano),
+		Timestamp:       kernelTime(ev.Ts).Format(time.RFC3339Nano),
 		EventType:       "connection",
 		PID:             ev.Pid,
 		Comm:            strings.Trim(string(ev.Comm[:]), "\x00"),
@@ -906,6 +909,8 @@ func (r *Runner) tryClassifyAndFormatConnection(ev *Event) (string, error) {
 		Category:        string(result.Category),
 		Confidence:      int(result.Confidence),
 		DetectionReason: result.Reason,
+		TLS:             result.TLS,
+		ServerName:      result.ServerName,
 	}
 
 	// Enrich with container metadata if resolver is available
@@ -959,6 +964,18 @@ func (r *Runner) tryClassifyAndFormatConnection(ev *Event) (string, error) {
 			}
 		}
 
+	}
+
+	// Link the connection to the env variables that hold its address.
+	if env, err := r.processEnv(ev.Pid); err == nil {
+		hosts := []string{result.ServerName}
+		if daddr.IsValid() {
+			hosts = append(hosts, daddr.String())
+		}
+		if event.DestinationContainer != nil {
+			hosts = append(hosts, event.DestinationContainer.Service, event.DestinationContainer.ContainerName)
+		}
+		event.EnvHints = envNameHints(env, hosts, dport)
 	}
 
 	// Record connection event for service map
@@ -1043,6 +1060,9 @@ func (r *Runner) tryClassifyAndFormatConnection(ev *Event) (string, error) {
 			Port:       dport,
 			Confidence: event.Confidence,
 			Reason:     event.DetectionReason,
+			TLS:        event.TLS,
+			ServerName: event.ServerName,
+			EnvHints:   event.EnvHints,
 		})
 	}
 
@@ -1140,8 +1160,39 @@ func ipFromBytes(family uint16, raw []byte) netip.Addr {
 		copy(b[:], raw)
 		return netip.AddrFrom16(b)
 	default:
+		if debugEvents {
+			log.Printf("debug: unknown address family %d, raw address %x", family, raw)
+		}
+		return inferAddr(raw)
+	}
+}
+
+// debugEvents prints extra detail about events the profiler cannot decode.
+var debugEvents = os.Getenv("PROFILER_DEBUG") == "1"
+
+// inferAddr guesses the address when the kernel did not report a usable family:
+// four leading bytes with nothing after them is IPv4, anything else non-zero is
+// IPv6, and all zeros is no address.
+func inferAddr(raw []byte) netip.Addr {
+	if len(raw) < 4 {
 		return netip.Addr{}
 	}
+	var wide [16]byte
+	copy(wide[:], raw)
+	tail := false
+	for _, b := range wide[4:] {
+		if b != 0 {
+			tail = true
+			break
+		}
+	}
+	switch {
+	case !tail && (wide[0]|wide[1]|wide[2]|wide[3]) != 0:
+		return netip.AddrFrom4([4]byte{wide[0], wide[1], wide[2], wide[3]})
+	case tail:
+		return netip.AddrFrom16(wide)
+	}
+	return netip.Addr{}
 }
 
 func ensureMemlock() error {

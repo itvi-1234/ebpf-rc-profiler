@@ -103,8 +103,9 @@ func (ct *ConnTracker) Classify(key ConnKey, pid uint32, meta ConnMeta, payload 
 
 	// Store first bytes if we don't have them yet
 	if len(state.FirstBytes) == 0 && len(payload) > 0 {
-		// Store up to 256 bytes for classification
-		maxBytes := 256
+		// Store up to 512 bytes for classification (a TLS ClientHello with SNI
+		// can exceed 256)
+		maxBytes := 512
 		if len(payload) < maxBytes {
 			maxBytes = len(payload)
 		}
